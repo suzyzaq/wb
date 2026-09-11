@@ -1,0 +1,9 @@
+# 纯白图识别云插件依赖
+# 受管 Python 3.13 已预装以下包；若部署到新环境请执行：
+#   python -m venv venv && venv\Scripts\activate && pip install -r requirements.txt
+fastapi>=0.110
+uvicorn>=0.27
+numpy>=1.26
+Pillow>=10.0
+python-multipart>=0.0.9
+requests>=2.31

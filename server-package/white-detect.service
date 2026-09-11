@@ -1,0 +1,23 @@
+# 纯白图识别服务 · systemd 单元
+# 用法：
+#   1) 把本目录放到 /opt/white-detect
+#   2) 建虚拟环境：python3 -m venv venv && venv/bin/pip install -r requirements.txt
+#   3) 复制本文件到 /etc/systemd/system/white-detect.service
+#   4) systemctl daemon-reload && systemctl enable --now white-detect
+#   5) 健康检查：curl http://localhost:7861/api/v1/health
+
+[Unit]
+Description=纯白图识别 API 服务
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/white-detect
+ExecStart=/opt/white-detect/venv/bin/uvicorn server:app --host 0.0.0.0 --port 7861 --workers 4
+Environment=WHITE_DETECT_PORT=7861
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

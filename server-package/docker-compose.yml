@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  white-detect:
+    build: .
+    image: white-image-detect:1.0.0
+    container_name: white-detect
+    restart: unless-stopped
+    ports:
+      - "${PORT:-7861}:7861"
+    environment:
+      - WHITE_DETECT_PORT=7861
+      # 填本服务对外可达的域名/地址，用于 guide 页面与 openapi 回显（可选）
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:7861/api/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

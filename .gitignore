@@ -1,0 +1,27 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── PyInstaller 构建产物 ──
+build/
+dist/
+*.spec
+
+# ── 运行时 / 调试产物 ──
+*.log
+*.progress.json
+已完成部分.xlsx
+待处理*.xlsx
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 可执行文件（体积大，建议走 GitHub Release 发布）──
+*.exe
