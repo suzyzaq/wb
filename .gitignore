@@ -7,8 +7,11 @@ venv/
 
 # ── PyInstaller 构建产物 ──
 build/
-dist/
 *.spec
+
+# ── dist 目录：只保留主 exe，其余（调试日志、旧版本）忽略 ──
+dist/*
+!dist/WhiteImageExcel.exe
 
 # ── 运行时 / 调试产物 ──
 *.log
@@ -22,6 +25,3 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ── 可执行文件（体积大，建议走 GitHub Release 发布）──
-*.exe
