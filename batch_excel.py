@@ -111,7 +111,7 @@ def short_label(res: dict) -> str:
 def run_batch(input, output=None, cols=None, sheet=None, workers=8,
               threshold=0.99, max_colors=3, limit=0, resume=False,
               rules=("any", "all"), rule=None, progress_cb=None,
-              offset=0, persist_every=300) -> dict:
+              offset=0, persist_every=300, cancel_check=None) -> dict:
     """
     批量检测 Excel 中的图片 URL，结果写回 output Excel。
 
@@ -128,6 +128,9 @@ def run_batch(input, output=None, cols=None, sheet=None, workers=8,
       resume      断点续跑（读取已有 .progress.json）
       persist_every 运行中每完成 N 个 URL 就落盘一次进度（默认 300；0=只在结束时落盘）
                   另：距上次落盘超过 60 秒也会落盘。用于长任务防丢进度。
+      cancel_check 可选回调，返回 True 表示要求停止；每完成一个任务检查一次。
+                  取消时：未开始的任务被取消，进度落盘，返回 summary 带 cancelled=True
+                  （不写完整 Excel，可改用 export_from_progress 导出已完成部分）
       rules       要输出的判定维度集合，如 ("any","all") / ("any",) / ("all",)
                   默认 ("any","all") —— 一次扫描同时输出两种维度
       rule        【向后兼容】旧版单值规则（"any" / "all"），等价于 rules=(rule,)
@@ -222,8 +225,10 @@ def run_batch(input, output=None, cols=None, sheet=None, workers=8,
                       ensure_ascii=False)
         os.replace(tmp, prog_path)
 
+    cancelled = False
     if tasks:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
+        ex = ThreadPoolExecutor(max_workers=workers)
+        try:
             fut_map = {}
             for r_idx, col, url in tasks:
                 f = ex.submit(detect_from_url, url,
@@ -233,6 +238,10 @@ def run_batch(input, output=None, cols=None, sheet=None, workers=8,
             done = 0
             _t_last = [time.time()]
             for f in as_completed(fut_map):
+                # ── 取消检查：收到停止指令立即跳出，未开始的任务会被取消 ──
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    break
                 r_idx, col, url = fut_map[f]
                 res = f.result()
                 with lock:
@@ -259,12 +268,50 @@ def run_batch(input, output=None, cols=None, sheet=None, workers=8,
                     if progress_cb and done % 5 == 0:
                         progress_cb(done, len(tasks),
                                     f"已完成 {done}/{len(tasks)} 个 URL 检测")
-            if progress_cb:
-                progress_cb(len(tasks), len(tasks), "检测完成，正在写回 Excel…")
-            persist()
+
+            if cancelled:
+                # 取消队列中尚未开始的任务（正在执行的 workers 个会自然跑完，通常几秒内）
+                ex.shutdown(wait=False, cancel_futures=True)
+                with lock:
+                    persist()          # 保存已完成的，便于后续 --resume 或导出
+                if progress_cb:
+                    progress_cb(done, len(tasks),
+                                f"[已停止] 收到停止指令，已完成 {done}/{len(tasks)} 个 URL，"
+                                f"进度已保存")
+            else:
+                if progress_cb:
+                    progress_cb(len(tasks), len(tasks), "检测完成，正在写回 Excel…")
+                persist()
+        finally:
+            ex.shutdown(wait=False)
     else:
         if progress_cb:
             progress_cb(0, 0, "[信息] 无待处理任务（可能已全部完成）")
+
+    if cancelled:
+        # 被取消：不写完整 Excel（未完成行无意义），直接返回已完成统计
+        rows_done = len(results)
+        non_any = sum(1 for r in results.values()
+                      if (r.get("cols") and
+                          sum(1 for c in r["cols"].values()
+                              for p in c.get("per", []) if p.get("is_white_image")) > 0))
+        return {
+            "cancelled": True,
+            "output": out_path,
+            "total_rows": len(data_rows),
+            "source_total_rows": total_data_rows,
+            "offset": offset,
+            "rows_done": rows_done,
+            "noncompliant_rows_any": non_any,
+            "noncompliant_rows_all": 0,
+            "white_rows": non_any,
+            "noncompliant_rows": non_any,
+            "white_imgs": 0, "normal_imgs": 0, "fail_imgs": 0,
+            "elapsed": round(time.time() - t0, 1),
+            "selected_cols": selected,
+            "rules": list(rules or ("any", "all")),
+            "progress_path": prog_path,
+        }
 
     # ── 汇总每个源行的判定 ──
     # 向后兼容：旧调用者可能传 rule="any"，归一成 rules 元组
@@ -555,7 +602,7 @@ def merge_chunks(chunk_paths, out_path, rules=("any", "all"), input_name="",
 def run_batch_chunked(input, output=None, chunk_size=1000, cols=None, sheet=None,
                       workers=8, threshold=0.99, max_colors=3, rules=("any", "all"),
                       resume=False, limit=0, progress_cb=None, chunk_cb=None,
-                      persist_every=300) -> dict:
+                      persist_every=300, cancel_check=None) -> dict:
     """
     分批执行：数据超过 chunk_size 行时自动拆成多批，每批产出独立 Excel；
     每批完成即通过 chunk_cb 回调（GUI 可即时下载），全部完成后合并成全量 Excel。
@@ -593,6 +640,8 @@ def run_batch_chunked(input, output=None, chunk_size=1000, cols=None, sheet=None
 
     chunk_paths = []
     last_summary = {}
+    cancelled = False
+    done_rows_acc = 0
 
     def _emit(d, t, m):
         if progress_cb:
@@ -601,6 +650,12 @@ def run_batch_chunked(input, output=None, chunk_size=1000, cols=None, sheet=None
     for ci in range(total_chunks):
         off = ci * chunk_size_eff
         n = min(chunk_size_eff, work_rows - off)
+        # 批次之间也检查一次取消信号（避免上一批刚结束又启动下一批）
+        if ci > 0 and cancel_check and cancel_check():
+            cancelled = True
+            if progress_cb:
+                progress_cb(0, 0, f"[已停止] 在开始第 {ci+1}/{total_chunks} 批前收到停止指令")
+            break
         if total_chunks == 1:
             cpath = out_path
         else:
@@ -616,14 +671,41 @@ def run_batch_chunked(input, output=None, chunk_size=1000, cols=None, sheet=None
             input, output=cpath, cols=cols, sheet=sheet, workers=workers,
             threshold=threshold, max_colors=max_colors,
             limit=n, offset=off, resume=resume, rules=rules, progress_cb=_cb,
-            persist_every=persist_every,
+            persist_every=persist_every, cancel_check=cancel_check,
         )
         last_summary = s
+        if s.get("cancelled"):
+            # 该批未写出 Excel，不计入 chunk_paths；但已完成的行数要计入统计
+            cancelled = True
+            done_rows_acc += s.get("rows_done", 0)
+            if progress_cb:
+                progress_cb(0, 0, f"[已停止] 第 {ci+1}/{total_chunks} 批已取消"
+                                  f"（该批已完成 {s.get('rows_done', 0)} 行，未写出文件）")
+            break
+        done_rows_acc += s.get("rows_done", 0)
         chunk_paths.append(cpath)
         if chunk_cb:
             chunk_cb(ci + 1, total_chunks, s, cpath)
 
     elapsed = round(time.time() - t0, 1)
+
+    if cancelled:
+        # 被取消：只交付「已完整跑完的批次」，不合并全量
+        result = {
+            "cancelled": True,
+            "output": None,
+            "chunk_paths": chunk_paths,
+            "completed_chunks": len(chunk_paths),
+            "total_chunks": total_chunks,
+            "total_rows": total_rows,
+            "rows_done": done_rows_acc,
+            "noncompliant_rows_any": 0, "noncompliant_rows_all": 0,
+            "white_imgs": 0, "normal_imgs": 0, "fail_imgs": 0,
+            "elapsed": elapsed,
+            "chunk_size": chunk_size_eff, "chunks": len(chunk_paths),
+            "rules": list(rules),
+        }
+        return result
 
     if total_chunks == 1:
         # 单批：直接复用该批 summary（已是全量）

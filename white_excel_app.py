@@ -158,6 +158,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
          font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap}
   .dl-sm:hover{filter:brightness(.95)}
   .dl-sm:disabled{background:#9db4e8;cursor:not-allowed}
+  .dl-sm.stop{background:var(--warn)}
+  .dl-sm.stop:disabled{background:#e5a3a3;cursor:not-allowed}
   .dlrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .partialrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;
               padding-top:10px;border-top:1px dashed var(--line)}
@@ -235,11 +237,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <div class="batchbar" id="batchbar"></div>
     <div class="log" id="log"></div>
 
-    <!-- 运行中随时导出已完成部分 -->
+    <!-- 运行中操作：停止任务 / 导出已完成部分 -->
     <div class="partialrow">
+      <button class="dl-sm stop" id="btnStop" onclick="stopTask()">■ 停止任务</button>
       <button class="dl-sm" id="btnPartial" onclick="downloadPartial()">导出已完成部分</button>
-      <span class="muted" style="font-size:12px">
-        不必等全部跑完 —— 立即导出一份含「已完成行」的 Excel（未完成的行标为「未处理」）
+      <span class="muted" style="font-size:12px" id="partialHint">
+        不必等全部跑完 —— 可随时停止并导出已完成的行（未完成的行标「未处理」）
       </span>
     </div>
 
@@ -359,6 +362,11 @@ $("#start").onclick = async ()=>{
   const log = $("#log"); log.textContent = "";
   $("#bar").style.width = "0%";
   $("#start").disabled = true;
+  // 重置「停止任务」按钮与提示（v4.4）
+  const bs = $("#btnStop");
+  if(bs){ bs.disabled = false; bs.textContent = "■ 停止任务"; }
+  const hint = $("#partialHint");
+  if(hint) hint.textContent = "不必等全部跑完 —— 可随时停止并导出已完成的行（未完成的行标「未处理」）";
 
   const body = {
     filename:fileName, data:fileB64,
@@ -405,6 +413,10 @@ async function poll(){
       showResult(j);
       return;
     }
+    if(j.status==="stopped"){
+      showStopped(j);
+      return;
+    }
     if(j.status==="error"){
       log.textContent += "\n[错误] " + (j.error||"未知错误");
       $("#start").disabled=false;
@@ -434,6 +446,41 @@ function renderChunks(sel, chunks, inResult){
   box.querySelectorAll("button[data-chunk]").forEach(b=>{
     b.onclick = ()=> downloadChunk(b.dataset.chunk, b.dataset.name, b);
   });
+}
+
+// 停止当前任务（v4.4）
+async function stopTask(){
+  const btn = $("#btnStop");
+  if(!confirm("确定停止当前任务吗？\n\n· 已跑完的批次会保留，可随时下载 / 导出\n· 未完成的部分不会继续\n· 输入文件会保留，之后可用 --resume 续跑")) return;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "停止中…";
+  try{
+    const r = await fetch("/api/stop", {method:"POST"});
+    const j = await r.json();
+    const log = $("#log");
+    log.textContent += "\n" + (j.msg || "已发送停止指令");
+    log.scrollTop = log.scrollHeight;
+    if(!j.ok){ btn.disabled = false; btn.textContent = old; }
+    // 成功则保持禁用，等轮询切到 stopped 状态
+  }catch(e){
+    alert("发送停止指令失败：" + e);
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+// 已停止状态（v4.4）
+function showStopped(j){
+  const s = j.summary || {};
+  const done = s.completed_chunks || 0, total = s.total_chunks || 0;
+  $("#bar").style.width = "100%";
+  $("#batchbar").textContent = "已停止：完成 " + done + "/" + total + " 批，共 " + (s.rows_done||0) + " 行";
+  const btnStop = $("#btnStop");
+  if(btnStop){ btnStop.disabled = true; btnStop.textContent = "已停止"; }
+  const hint = $("#partialHint");
+  if(hint) hint.textContent = "任务已停止 —— 点「导出已完成部分」取走已完成的 " + (s.rows_done||0) + " 行";
+  $("#start").disabled = false;
+  // 已完成批次列表保留，可继续下载
+  renderChunks("#chunkList", j.chunks || [], false);
 }
 
 // 运行中导出「已完成部分」
@@ -519,7 +566,10 @@ _STATE = {"done": 0, "total": 0, "msg": "", "status": "idle",
           "current_chunk": 0,
           "chunk_size": 0,
           "final_name": "", "final_b64": None,
-          "tmpdir": "", "input_path": "", "rules": ["any", "all"], "cols": []}
+          "tmpdir": "", "input_path": "", "rules": ["any", "all"], "cols": [],
+          "cancel_evt": None,     # threading.Event：前端「停止任务」用它发信号
+          "stopping": False,      # 是否已收到停止指令（等待当前任务响应）
+          "cancel_scope": ""}     # 停止作用的范围描述
 _STATE_LOCK = threading.Lock()
 
 
@@ -542,6 +592,7 @@ def _get_state():
                     for c in (st.get("chunks") or [])]
     st.pop("final_b64", None)
     st.pop("result_b64", None)
+    st.pop("cancel_evt", None)   # threading.Event 不可 JSON 序列化
     return st
 
 
@@ -626,15 +677,17 @@ def _run_detect(filename, data_b64, sheet, cols, rules, workers, threshold,
     if isinstance(rules, str):
         rules = tuple(r.strip() for r in rules.split(",") if r.strip() in ("any", "all"))
     rules = tuple(rules or ("any", "all"))
+    keep_input = False        # 被用户中止时置 True，保留输入文件供「导出已完成部分」
     try:
         chunk_size = int(chunk_size or 0) or 1000
         total_rows = count_data_rows(in_path, sheet=sheet)
         chunk_total = (total_rows + chunk_size - 1) // chunk_size if total_rows else 1
         chunk_total = max(1, chunk_total)
+        cancel_evt = threading.Event()
         _set_state(tmpdir=tmpdir, input_path=in_path, rules=list(rules),
                    cols=list(cols or []), chunks=[], chunk_total=chunk_total,
                    current_chunk=0, chunk_size=chunk_size, final_b64=None,
-                   status="running",
+                   status="running", cancel_evt=cancel_evt, stopping=False,
                    msg=f"读取到 {total_rows} 行，按每 {chunk_size} 行共 {chunk_total} 批执行")
 
         def cb(d, t, m):
@@ -666,7 +719,29 @@ def _run_detect(filename, data_b64, sheet, cols, rules, workers, threshold,
             cols=",".join(cols) if cols else None,
             workers=workers, threshold=threshold, rules=rules,
             chunk_size=chunk_size, progress_cb=cb, chunk_cb=chunk_done,
+            cancel_check=cancel_evt.is_set,
         )
+
+        if s.get("cancelled"):
+            # 用户在前端点了「停止任务」
+            keep_input = True          # 保留输入文件，供「导出已完成部分」使用
+            _set_state(status="stopped", stopping=False,
+                       final_b64=None, final_name="",
+                       done=s.get("rows_done", 0), total=s.get("rows_done", 0),
+                       current_chunk=s.get("completed_chunks", 0),
+                       summary={"rules": list(rules), "cancelled": True,
+                                "chunks": s.get("completed_chunks", 0),
+                                "completed_chunks": s.get("completed_chunks", 0),
+                                "total_chunks": s.get("total_chunks", chunk_total),
+                                "chunk_size": chunk_size,
+                                "rows_done": s.get("rows_done", 0),
+                                "noncompliant_rows_any": 0, "noncompliant_rows_all": 0,
+                                "white_imgs": 0, "normal_imgs": 0, "fail_imgs": 0,
+                                "out_name": ""},
+                       msg=f"已停止 ✓ 已完成 {s.get('completed_chunks',0)}/"
+                           f"{s.get('total_chunks', chunk_total)} 批、"
+                           f"{s.get('rows_done',0)} 行；可点「导出已完成部分」取用")
+            return
 
         with open(s["output"], "rb") as f:
             final_b64 = base64.b64encode(f.read()).decode("ascii")
@@ -689,10 +764,12 @@ def _run_detect(filename, data_b64, sheet, cols, rules, workers, threshold,
     except Exception as e:
         _set_state(status="error", error=str(e), msg=f"[错误] {e}")
     finally:
-        try:
-            os.remove(in_path)
-        except Exception:
-            pass
+        # 正常结束才清理输入文件；被用户中止时保留（「导出已完成部分」需要它）
+        if not keep_input:
+            try:
+                os.remove(in_path)
+            except Exception:
+                pass
 
 
 def _launch_web():
@@ -772,7 +849,8 @@ def _launch_web():
                     _set_state(done=0, total=0, msg="开始…", status="running",
                                result_b64=None, summary=None, error=None,
                                chunks=[], chunk_total=0, current_chunk=0,
-                               final_b64=None, final_name="")
+                               final_b64=None, final_name="",
+                               cancel_evt=None, stopping=False)
                     t = threading.Thread(
                         target=_run_detect,
                         args=(d.get("filename"), d.get("data"), d.get("sheet"),
@@ -782,6 +860,23 @@ def _launch_web():
                         daemon=True)
                     t.start()
                     self._send(200, {"ok": True})
+                    return
+                if self.path == "/api/stop":
+                    # 前端「停止任务」：给正在跑的任务发取消信号
+                    with _STATE_LOCK:
+                        evt = _STATE.get("cancel_evt")
+                        st = _STATE.get("status")
+                    if st != "running":
+                        self._send(200, {"ok": False,
+                                         "msg": f"当前没有正在运行的任务（状态：{st}）"})
+                        return
+                    if evt is None:
+                        self._send(200, {"ok": False, "msg": "无法发送停止信号（任务未就绪）"})
+                        return
+                    evt.set()
+                    _set_state(stopping=True,
+                               msg="[停止中] 已发送停止指令，正在等待当前任务收尾…")
+                    self._send(200, {"ok": True, "msg": "已发送停止指令"})
                     return
             except Exception as e:
                 self._send(500, {"error": str(e)})
