@@ -657,12 +657,17 @@ def run_batch_chunked(input, output=None, chunk_size=1000, cols=None, sheet=None
 
 
 def export_from_progress(input, progress_path, output=None, rules=("any", "all"),
-                         cols=None, sheet=None) -> dict:
+                         cols=None, sheet=None, only_done=True) -> dict:
     """
     从进度文件（*.progress.json）导出「当前已完成部分」的结果 Excel。
 
     用途：长任务跑到一半也能先把已完成的判定结果取走，不必等全部跑完。
-    未完成的行原样保留，判定列标为「未处理」。
+
+    only_done=True（默认）：
+        只导出「已完成」的行，并在首列加「源表行号」便于回溯 ——
+        大表运行中导出为秒级（不写上万行「未处理」占位行，避免与检测线程抢 GIL 卡死）
+    only_done=False：
+        输出全表，未完成的行判定列标为「未处理」（行号与源表完全对齐，仅建议任务结束后用）
 
     返回 {output, total_rows, rows_done, pending_rows,
           noncompliant_rows_any, noncompliant_rows_all,
@@ -679,14 +684,31 @@ def export_from_progress(input, progress_path, output=None, rules=("any", "all")
         prog = json.load(f)
     results = {int(k): v for k, v in (prog.get("results") or {}).items()}
 
+    # ── 流式读源表：only_done 模式只保留「已完成」的行，其余直接丢弃 ──
     wb = openpyxl.load_workbook(input, read_only=True, data_only=True)
     ws = wb[sheet] if sheet else wb[wb.sheetnames[0]]
-    all_rows = list(ws.iter_rows(values_only=True))
-    wb.close()
-    if not all_rows:
+    it = ws.iter_rows(values_only=True)
+    first = next(it, None)
+    if first is None:
+        wb.close()
         raise ValueError("表格为空")
-    header = [str(c) if c is not None else "" for c in all_rows[0]]
-    data_rows = all_rows[1:]
+    header = [str(c) if c is not None else "" for c in first]
+
+    if only_done:
+        done_src: dict[int, tuple] = {}
+        total_data_rows = 0
+        for i, src in enumerate(it):
+            total_data_rows += 1
+            r_idx = i + 2
+            row_res = results.get(r_idx)
+            if row_res and row_res.get("cols"):
+                done_src[r_idx] = src
+        data_rows = None
+    else:
+        done_src = None
+        data_rows = list(it)
+        total_data_rows = len(data_rows)
+    wb.close()
 
     if cols:
         selected = [c.strip() for c in cols.split(",") if c.strip()]
@@ -730,62 +752,101 @@ def export_from_progress(input, progress_path, output=None, rules=("any", "all")
     out_wb = openpyxl.Workbook()
     out_ws = out_wb.active
     out_ws.title = "检测结果"
-    out_ws.append(list(header) + out_appended)
 
     non_any = non_all = 0
     white_imgs = normal_imgs = fail_imgs = 0
     rows_done = 0
 
-    for i, src in enumerate(data_rows):
-        r_idx = i + 2
-        row_res = results.get(r_idx)
-        vals = list(src)
-        while len(vals) < len(header):
-            vals.append(None)
-        if not row_res or not row_res.get("cols"):
-            # 尚未处理的行
-            for _col in selected:
-                vals += ["未处理", "—", "—"]
-            for _r in rules:
-                vals.append("未处理")
-            vals += ["—", "—"]
+    if only_done:
+        # 只写已完成行，首列「源表行号」
+        out_ws.append(["源表行号"] + list(header) + out_appended)
+        for r_idx in sorted(done_src):
+            src = done_src[r_idx]
+            row_res = results.get(r_idx)
+            vals = [r_idx]
+            v = list(src)
+            while len(v) < len(header):
+                v.append(None)
+            vals += v
+            rows_done += 1
+            for col in selected:
+                colres = row_res.get("cols", {}).get(col, {})
+                vals.append("是" if colres.get("has_white") else ("否" if "per" in colres else "—"))
+                vals.append(colres.get("white_count", "—"))
+                vals.append(colres.get("detail", "—"))
+            ov = row_res.get("overall", {})
+            for r in rules:
+                key = "noncompliant_any" if r == "any" else "noncompliant_all"
+                vals.append("是" if ov.get(key) else "否")
+            vals.append(ov.get("white_total", 0))
+            vals.append(ov.get("total", 0))
             out_ws.append(vals)
-            continue
-        rows_done += 1
-        for col in selected:
-            colres = row_res.get("cols", {}).get(col, {})
-            vals.append("是" if colres.get("has_white") else ("否" if "per" in colres else "—"))
-            vals.append(colres.get("white_count", "—"))
-            vals.append(colres.get("detail", "—"))
-        ov = row_res.get("overall", {})
-        for r in rules:
-            key = "noncompliant_any" if r == "any" else "noncompliant_all"
-            vals.append("是" if ov.get(key) else "否")
-        vals.append(ov.get("white_total", 0))
-        vals.append(ov.get("total", 0))
-        out_ws.append(vals)
 
-        if ov.get("noncompliant_any"):
-            non_any += 1
-        if ov.get("noncompliant_all"):
-            non_all += 1
-        white_imgs += ov.get("white_total", 0)
-        for colres in row_res.get("cols", {}).values():
-            for p in colres.get("per", []):
-                if not p.get("success"):
-                    fail_imgs += 1
-                elif not p.get("is_white_image"):
-                    normal_imgs += 1
+            if ov.get("noncompliant_any"):
+                non_any += 1
+            if ov.get("noncompliant_all"):
+                non_all += 1
+            white_imgs += ov.get("white_total", 0)
+            for colres in row_res.get("cols", {}).values():
+                for p in colres.get("per", []):
+                    if not p.get("success"):
+                        fail_imgs += 1
+                    elif not p.get("is_white_image"):
+                        normal_imgs += 1
+        pending = total_data_rows - rows_done
+    else:
+        out_ws.append(list(header) + out_appended)
+        for i, src in enumerate(data_rows):
+            r_idx = i + 2
+            row_res = results.get(r_idx)
+            vals = list(src)
+            while len(vals) < len(header):
+                vals.append(None)
+            if not row_res or not row_res.get("cols"):
+                # 尚未处理的行
+                for _col in selected:
+                    vals += ["未处理", "—", "—"]
+                for _r in rules:
+                    vals.append("未处理")
+                vals += ["—", "—"]
+                out_ws.append(vals)
+                continue
+            rows_done += 1
+            for col in selected:
+                colres = row_res.get("cols", {}).get(col, {})
+                vals.append("是" if colres.get("has_white") else ("否" if "per" in colres else "—"))
+                vals.append(colres.get("white_count", "—"))
+                vals.append(colres.get("detail", "—"))
+            ov = row_res.get("overall", {})
+            for r in rules:
+                key = "noncompliant_any" if r == "any" else "noncompliant_all"
+                vals.append("是" if ov.get(key) else "否")
+            vals.append(ov.get("white_total", 0))
+            vals.append(ov.get("total", 0))
+            out_ws.append(vals)
+
+            if ov.get("noncompliant_any"):
+                non_any += 1
+            if ov.get("noncompliant_all"):
+                non_all += 1
+            white_imgs += ov.get("white_total", 0)
+            for colres in row_res.get("cols", {}).values():
+                for p in colres.get("per", []):
+                    if not p.get("success"):
+                        fail_imgs += 1
+                    elif not p.get("is_white_image"):
+                        normal_imgs += 1
+        pending = total_data_rows - rows_done
 
     sum_ws = out_wb.create_sheet("汇总")
-    pending = len(data_rows) - rows_done
     summary = [
         ("纯白图识别 · 已完成部分导出（中途快照）", ""),
+        ("导出模式", "仅已完成行" if only_done else "全表（未完成行标「未处理」）"),
         ("输入文件", input),
         ("进度文件", progress_path),
         ("输出文件", out_path),
         ("URL 列", ", ".join(selected)),
-        ("数据总行数", len(data_rows)),
+        ("数据总行数", total_data_rows),
         ("已完成行数", rows_done),
         ("未处理行数", pending),
         ("不合规行数（一张即不合规 · any）", non_any),
@@ -803,7 +864,7 @@ def export_from_progress(input, progress_path, output=None, rules=("any", "all")
 
     return {
         "output": out_path,
-        "total_rows": len(data_rows),
+        "total_rows": total_data_rows,
         "rows_done": rows_done,
         "pending_rows": pending,
         "noncompliant_rows_any": non_any,
